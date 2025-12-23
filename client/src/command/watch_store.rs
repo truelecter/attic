@@ -38,6 +38,11 @@ pub struct WatchStore {
     /// Always send the upload info as part of the payload.
     #[clap(long, hide = true)]
     force_preamble: bool,
+
+    /// The max chunk size for uploads. If a NAR is larger than this,
+    /// it will be split into multiple chunks.
+    #[clap(long, default_value = "33554432")]
+    max_chunk_size: u64,
 }
 
 pub async fn run(opts: Opts) -> Result<()> {
@@ -65,6 +70,7 @@ pub async fn run(opts: Opts) -> Result<()> {
     let push_config = PushConfig {
         num_workers: sub.jobs,
         force_preamble: sub.force_preamble,
+        max_chunk_size: sub.max_chunk_size,
     };
 
     let push_session_config = PushSessionConfig {

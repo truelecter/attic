@@ -14,6 +14,9 @@ pub(crate) fn get_router() -> Router {
             post(get_missing_paths::get_missing_paths),
         )
         .route("/_api/v1/upload-path", put(upload_path::upload_path))
+        .route("/_api/v1/upload-session", post(upload_path::start_upload_session))
+        .route("/_api/v1/upload-session/:id/put/:seq", post(upload_path::upload_part))
+        .route("/_api/v1/upload-session/:id/finalize", post(upload_path::finalize_upload))
         .route(
             "/:cache/attic-cache-info",
             get(cache_config::get_cache_config),

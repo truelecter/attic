@@ -14,6 +14,7 @@ use reqwest::{
     Body, Client as HttpClient, Response, StatusCode, Url,
 };
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::config::ServerConfig;
 use crate::version::ATTIC_DISTRIBUTOR;
@@ -209,6 +210,73 @@ impl ApiClient {
                 Ok(r) => Ok(Some(r)),
                 Err(_) => Ok(None),
             }
+        } else {
+            let api_error = ApiError::try_from_response(res).await?;
+            Err(api_error.into())
+        }
+    }
+
+    pub async fn start_upload_session(&self, nar_info: &UploadPathNarInfo) -> Result<Uuid> {
+        let endpoint = self.endpoint.join("_api/v1/upload-session")?;
+
+        let res = self
+            .client
+            .post(endpoint)
+            .header(USER_AGENT, HeaderValue::from_str(ATTIC_USER_AGENT)?)
+            .json(nar_info)
+            .send()
+            .await?;
+
+        if res.status().is_success() {
+            let session_id: Uuid = res.json::<String>().await?.parse()?;
+            Ok(session_id)
+        } else {
+            let api_error = ApiError::try_from_response(res).await?;
+            Err(api_error.into())
+        }
+    }
+
+    pub async fn upload_part(
+        &self,
+        session_id: Uuid,
+        part_seq: u64,
+        chunk: Bytes,
+    ) -> Result<()> {
+        let endpoint = self
+            .endpoint
+            .join(&format!("_api/v1/upload-session/{session_id}/put/{part_seq}"))?;
+
+        let res = self
+            .client
+            .post(endpoint)
+            .header(USER_AGENT, HeaderValue::from_str(ATTIC_USER_AGENT)?)
+            .body(chunk)
+            .send()
+            .await?;
+
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            let api_error = ApiError::try_from_response(res).await?;
+            Err(api_error.into())
+        }
+    }
+
+    pub async fn finalize_upload(&self, session_id: Uuid) -> Result<UploadPathResult> {
+        let endpoint = self
+            .endpoint
+            .join(&format!("_api/v1/upload-session/{session_id}/finalize"))?;
+
+        let res = self
+            .client
+            .post(endpoint)
+            .header(USER_AGENT, HeaderValue::from_str(ATTIC_USER_AGENT)?)
+            .send()
+            .await?;
+
+        if res.status().is_success() {
+            let result = res.json().await?;
+            Ok(result)
         } else {
             let api_error = ApiError::try_from_response(res).await?;
             Err(api_error.into())

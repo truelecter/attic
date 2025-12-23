@@ -2,11 +2,14 @@ use std::io;
 
 use std::io::Cursor;
 use std::marker::Unpin;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_compression::tokio::bufread::{BrotliEncoder, XzEncoder, ZstdEncoder};
 use async_compression::Level as CompressionLevel;
+use attic::cache::CacheName;
+use axum::extract::Path;
 use axum::{
     body::Body,
     extract::{Extension, Json},
@@ -21,7 +24,7 @@ use sea_orm::sea_query::Expr;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{QuerySelect, TransactionTrait};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufRead, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Semaphore;
 use tokio::task::spawn;
 use tokio_util::io::StreamReader;
@@ -31,6 +34,7 @@ use uuid::Uuid;
 use crate::compression::{CompressionStream, CompressorFn};
 use crate::config::CompressionType;
 use crate::error::{ErrorKind, ServerError, ServerResult};
+use crate::io::{ActiveUploadSession, OrderedPartReader, PartMessage};
 use crate::narinfo::Compression;
 use crate::{RequestState, State};
 use attic::api::v1::upload_path::{
@@ -150,34 +154,9 @@ pub(crate) async fn upload_path(
 
     let username = req_state.auth.username().map(str::to_string);
 
-    // Try to acquire a lock on an existing NAR
-    if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
-        // Deduplicate?
-        let missing_chunk = ChunkRef::find()
-            .filter(chunkref::Column::NarId.eq(existing_nar.id))
-            .filter(chunkref::Column::ChunkId.is_null())
-            .limit(1)
-            .one(database)
-            .await
-            .map_err(ServerError::database_error)?;
-
-        if missing_chunk.is_none() {
-            // Can actually be deduplicated
-            return upload_path_dedup(
-                username,
-                cache,
-                upload_info,
-                stream,
-                database,
-                &state,
-                existing_nar,
-            )
-            .await;
-        }
-    }
-
-    // New NAR or need to repair
-    upload_path_new(username, cache, upload_info, stream, database, &state).await
+    ingest_nar(username, cache, upload_info, stream, &database, &state)
+        .await
+        .map(Json)
 }
 
 /// Uploads a path when there is already a matching NAR in the global cache.
@@ -189,7 +168,7 @@ async fn upload_path_dedup(
     database: &DatabaseConnection,
     state: &State,
     existing_nar: NarGuard,
-) -> ServerResult<Json<UploadPathResult>> {
+) -> ServerResult<UploadPathResult> {
     if state.config.require_proof_of_possession {
         let (mut stream, nar_compute) = HashReader::new(stream, Sha256::new());
         tokio::io::copy(&mut stream, &mut tokio::io::sink())
@@ -249,11 +228,11 @@ async fn upload_path_dedup(
     // Ensure it's not unlocked earlier
     drop(existing_nar);
 
-    Ok(Json(UploadPathResult {
+    Ok(UploadPathResult {
         kind: UploadPathResultKind::Deduplicated,
         file_size: None, // TODO: Sum the chunks
         frac_deduplicated: None,
-    }))
+    })
 }
 
 /// Uploads a path when there is no matching NAR in the global cache.
@@ -268,7 +247,7 @@ async fn upload_path_new(
     stream: impl AsyncBufRead + Send + Unpin + 'static,
     database: &DatabaseConnection,
     state: &State,
-) -> ServerResult<Json<UploadPathResult>> {
+) -> ServerResult<UploadPathResult> {
     let nar_size_threshold = state.config.chunking.nar_size_threshold;
 
     if nar_size_threshold == 0 || upload_info.nar_size < nar_size_threshold {
@@ -286,7 +265,7 @@ async fn upload_path_new_chunked(
     stream: impl AsyncBufRead + Send + Unpin + 'static,
     database: &DatabaseConnection,
     state: &State,
-) -> ServerResult<Json<UploadPathResult>> {
+) -> ServerResult<UploadPathResult> {
     let chunking_config = &state.config.chunking;
     let compression_config = &state.config.compression;
     let compression_type = compression_config.r#type;
@@ -458,13 +437,13 @@ async fn upload_path_new_chunked(
 
     cleanup.cancel();
 
-    Ok(Json(UploadPathResult {
+    Ok(UploadPathResult {
         kind: UploadPathResultKind::Uploaded,
         file_size: Some(file_size),
 
         // Currently, frac_deduplicated is computed from size before compression
         frac_deduplicated: Some(deduplicated_size as f64 / *nar_size as f64),
-    }))
+    })
 }
 
 /// Uploads a path when there is no matching NAR in the global cache (unchunked).
@@ -477,7 +456,7 @@ async fn upload_path_new_unchunked(
     stream: impl AsyncBufRead + Send + Unpin + 'static,
     database: &DatabaseConnection,
     state: &State,
-) -> ServerResult<Json<UploadPathResult>> {
+) -> ServerResult<UploadPathResult> {
     let compression_config = &state.config.compression;
     let compression_type = compression_config.r#type;
     let compression: Compression = compression_type.into();
@@ -558,11 +537,11 @@ async fn upload_path_new_unchunked(
 
     txn.commit().await.map_err(ServerError::database_error)?;
 
-    Ok(Json(UploadPathResult {
+    Ok(UploadPathResult {
         kind: UploadPathResultKind::Uploaded,
         file_size: Some(file_size),
         frac_deduplicated: None,
-    }))
+    })
 }
 
 /// Uploads a chunk with the desired compression.
@@ -721,7 +700,12 @@ async fn upload_chunk(
 
     cleanup.cancel();
 
-    tracing::debug!("Repaired {} chunkrefs", repaired.rows_affected);
+    if repaired.rows_affected > 0 {
+        tracing::info!(
+            "Repaired {} chunkrefs pointing to chunk {chunk_id}",
+            repaired.rows_affected
+        );
+    }
 
     let guard = ChunkGuard::from_locked(database.clone(), chunk);
 
@@ -794,4 +778,192 @@ impl UploadPathNarInfoExt for UploadPathNarInfo {
             ..Default::default()
         }
     }
+}
+
+pub(crate) async fn ingest_nar(
+    username: Option<String>,
+    cache: cache::Model,
+    upload_info: UploadPathNarInfo,
+    stream: impl AsyncBufRead + Send + Unpin + 'static,
+    database: &DatabaseConnection,
+    state: &State,
+) -> ServerResult<UploadPathResult> {
+    // Try to acquire a lock on an existing NAR
+    if let Some(existing_nar) = database.find_and_lock_nar(&upload_info.nar_hash).await? {
+        let missing_chunk = ChunkRef::find()
+            .filter(chunkref::Column::NarId.eq(existing_nar.id))
+            .filter(chunkref::Column::ChunkId.is_null())
+            .limit(1)
+            .one(database)
+            .await
+            .map_err(ServerError::database_error)?;
+
+        if missing_chunk.is_none() {
+            // Can actually be deduplicated
+            return upload_path_dedup(
+                username,
+                cache,
+                upload_info,
+                stream,
+                database,
+                state,
+                existing_nar,
+            )
+            .await;
+        }
+    }
+
+    // New NAR or need to repair
+    upload_path_new(username, cache, upload_info, stream, database, state).await
+}
+
+pub(crate) async fn start_upload_session(
+    Extension(state): Extension<State>,
+    Extension(req_state): Extension<RequestState>,
+    Json(upload_info): Json<UploadPathNarInfo>,
+) -> ServerResult<Json<String>> {
+    let database = state.database().await?;
+    let username = req_state.auth.username().map(str::to_string);
+
+    let cache = req_state
+        .auth
+        .auth_cache(database, &upload_info.cache, |cache, permission| {
+            permission.require_push()?;
+            Ok(cache)
+        })
+        .await?;
+    let cache_name = cache.name.clone();
+
+    let session_id = Uuid::new_v4();
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+
+    let stream = BufReader::new(OrderedPartReader::new(rx, 50));
+
+    let database_clone = database.clone();
+    let state_clone = state.clone();
+    let upload_info_clone = upload_info.clone();
+    let username_clone = username.clone();
+
+    // TODO: handle cancellation and timeouts. (remove from active uploads, prune staging dir. Not sure about chunks)
+    let result_handle: tokio::task::JoinHandle<Result<UploadPathResult, ServerError>> =
+        tokio::spawn(async move {
+            ingest_nar(
+                username_clone,
+                cache,
+                upload_info_clone,
+                stream,
+                &database_clone,
+                &state_clone,
+            )
+            .await
+        });
+
+    state.uploads.insert(
+        session_id,
+        ActiveUploadSession {
+            sender: tx,
+            result_handle,
+            username,
+            cache_name,
+        },
+    );
+
+    Ok(Json(session_id.to_string()))
+}
+
+pub async fn upload_part(
+    Path((session_id, seq)): Path<(Uuid, u64)>,
+    Extension(state): Extension<State>,
+    Extension(req_state): Extension<RequestState>,
+    body: Body,
+) -> ServerResult<()> {
+    let entry = state.uploads.get(&session_id).ok_or(ErrorKind::NotFound)?;
+    let ActiveUploadSession {
+        sender, cache_name, ..
+    } = entry.value();
+
+    let database = state.database().await?;
+    let _ = req_state
+        .auth
+        .auth_cache(
+            database,
+            &CacheName::new(cache_name.clone())?,
+            |cache, permission| {
+                permission.require_push()?;
+                Ok(cache)
+            },
+        )
+        .await?;
+
+    let staging_dir = PathBuf::from("/tmp/attic-staging").join(session_id.to_string());
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(ServerError::storage_error)?;
+    let part_path = staging_dir.join(seq.to_string());
+
+    let mut file = tokio::fs::File::create(&part_path)
+        .await
+        .map_err(ServerError::storage_error)?;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ErrorKind::StorageError(e.into()))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(ServerError::storage_error)?;
+    }
+
+    sender
+        .send(PartMessage::Part {
+            seq,
+            path: part_path,
+        })
+        .await
+        .map_err(|e| {
+            ErrorKind::StorageError(anyhow!("Failed to send part to upload session: {}", e))
+        })?;
+
+    Ok(())
+}
+
+pub async fn finalize_upload(
+    Path(session_id): Path<Uuid>,
+    Extension(state): Extension<State>,
+    Extension(req_state): Extension<RequestState>,
+) -> ServerResult<Json<UploadPathResult>> {
+    let cache_name = {
+        let entry = state.uploads.get(&session_id).ok_or(ErrorKind::NotFound)?;
+        entry.value().cache_name.clone()
+    };
+    let database = state.database().await?;
+    let _ = req_state
+        .auth
+        .auth_cache(
+            database,
+            &CacheName::new(cache_name)?,
+            |cache, permission| {
+                permission.require_push()?;
+                Ok(cache)
+            },
+        )
+        .await?;
+
+    let ActiveUploadSession {
+        sender,
+        result_handle,
+        ..
+    } = state
+        .uploads
+        .remove(&session_id)
+        .ok_or(ErrorKind::NotFound)?
+        .1;
+
+    drop(sender);
+    let result = result_handle.await.map_err(|e| {
+        ErrorKind::StorageError(anyhow!("Failed to join upload session task: {e}"))
+    })??;
+    let staging_dir = PathBuf::from("/tmp/attic-staging").join(session_id.to_string());
+    let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+
+    Ok(Json(result))
 }
