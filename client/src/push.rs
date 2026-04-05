@@ -24,7 +24,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use async_channel as channel;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
+use futures::StreamExt;
 use futures::future::join_all;
 use futures::stream::{Stream, TryStreamExt};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
@@ -50,6 +51,9 @@ pub struct PushConfig {
 
     /// Whether to always include the upload info in the PUT payload.
     pub force_preamble: bool,
+
+    /// The chunk size for multipart uploads.
+    pub max_chunk_size: u64,
 }
 
 /// Configuration for a push session.
@@ -263,6 +267,7 @@ impl Pusher {
                 &cache,
                 mp.clone(),
                 config.force_preamble,
+                config.max_chunk_size,
             )
             .await;
 
@@ -517,6 +522,7 @@ pub async fn upload_path(
     cache: &CacheName,
     mp: MultiProgress,
     force_preamble: bool,
+    max_chunk_size: u64,
 ) -> Result<()> {
     let path = &path_info.path;
     let upload_info = {
@@ -574,21 +580,24 @@ pub async fn upload_path(
         );
     let bar = mp.add(ProgressBar::new(path_info.nar_size));
     bar.set_style(style);
-    let nar_stream = NarStreamProgress::new(store.nar_from_path(path.to_owned()), bar.clone())
-        .map_ok(Bytes::from);
+    let nar_stream = NarStreamProgress::new(store.nar_from_path(path.to_owned()), bar.clone());
 
     let start = Instant::now();
-    match api
-        .upload_path(upload_info, nar_stream, force_preamble)
-        .await
-    {
+    let result = if path_info.nar_size > max_chunk_size {
+        upload_path_multipart(&api, upload_info, nar_stream, max_chunk_size).await
+    } else {
+        api.upload_path(upload_info, nar_stream.map_ok(Bytes::from), force_preamble)
+            .await
+            .map(|o| {
+                o.unwrap_or(UploadPathResult {
+                    kind: UploadPathResultKind::Uploaded,
+                    file_size: None,
+                    frac_deduplicated: None,
+                })
+            })
+    };
+    match result {
         Ok(r) => {
-            let r = r.unwrap_or(UploadPathResult {
-                kind: UploadPathResultKind::Uploaded,
-                file_size: None,
-                frac_deduplicated: None,
-            });
-
             let info_string: String = match r.kind {
                 UploadPathResultKind::Deduplicated => "deduplicated".to_string(),
                 _ => {
@@ -627,6 +636,84 @@ pub async fn upload_path(
             Err(e)
         }
     }
+}
+
+async fn upload_path_multipart<S>(
+    api: &ApiClient,
+    upload_info: UploadPathNarInfo,
+    stream: S,
+    chunk_size: u64,
+) -> Result<UploadPathResult>
+where
+    S: Stream<Item = AtticResult<Vec<u8>>> + Unpin + Send + Sync + 'static,
+{
+    let session_id = api.start_upload_session(&upload_info).await?;
+    let concurrent_uploads = 4;
+    
+    let chunk_stream = byte_chunker(stream, chunk_size as usize);    
+    chunk_stream
+        .map_ok(|(seq, chunk)| async move {
+            api.upload_part(session_id, seq, chunk).await
+        })
+        .try_buffer_unordered(concurrent_uploads)
+        .try_collect::<Vec<()>>()
+        .await?;
+
+    let result = api.finalize_upload(session_id).await?;
+    Ok(result)
+}
+
+/// Transforms a stream of byte vecs into a stream of exact-sized chunks (Bytes).
+/// Returns a tuple of (sequence_number, chunk_data).
+fn byte_chunker<S>(
+    stream: S,
+    chunk_size: usize,
+) -> impl Stream<Item = Result<(u64, Bytes)>>
+where
+    S: Stream<Item = AtticResult<Vec<u8>>> + Unpin,
+{
+    struct State<S> {
+        stream: S,
+        buffer: BytesMut,
+        seq: u64,
+    }
+
+    let initial_state = State {
+        stream,
+        buffer: BytesMut::with_capacity(chunk_size),
+        seq: 0,
+    };
+
+    futures::stream::unfold(initial_state, move |mut state| async move {
+        loop {
+            if state.buffer.len() >= chunk_size {
+                let chunk = state.buffer.split_to(chunk_size).freeze();
+                let seq = state.seq;
+                state.seq += 1;
+                return Some((Ok((seq, chunk)), state));
+            }
+
+            match state.stream.next().await {
+                Some(Ok(data)) => {
+                    state.buffer.put_slice(&data);
+                }
+                Some(Err(e)) => {
+                    return Some((Err(anyhow!(e)), state));
+                }
+                None => { 
+                    // EOF
+                    if !state.buffer.is_empty() {
+                        let chunk = state.buffer.split().freeze();
+                        let seq = state.seq;
+                        state.seq += 1;
+                        return Some((Ok((seq, chunk)), state));
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+    })
 }
 
 impl<S: Stream<Item = AtticResult<Vec<u8>>>> NarStreamProgress<S> {

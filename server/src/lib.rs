@@ -20,6 +20,7 @@ pub mod config;
 pub mod database;
 pub mod error;
 pub mod gc;
+pub mod io;
 mod middleware;
 mod narinfo;
 pub mod nix_manifest;
@@ -38,6 +39,7 @@ use axum::{
     http::{uri::Scheme, Uri},
     Router,
 };
+use dashmap::DashMap;
 use sea_orm::{query::Statement, ConnectionTrait, Database, DatabaseConnection};
 use tokio::net::TcpListener;
 use tokio::sync::OnceCell;
@@ -52,6 +54,9 @@ use database::migration::{Migrator, MigratorTrait};
 use error::{ErrorKind, ServerError, ServerResult};
 use middleware::{init_request_state, restrict_host, set_visibility_header};
 use storage::{LocalBackend, S3Backend, StorageBackend};
+use uuid::Uuid;
+
+use crate::io::ActiveUploadSession;
 
 type State = Arc<StateInner>;
 type RequestState = Arc<RequestStateInner>;
@@ -67,6 +72,9 @@ pub struct StateInner {
 
     /// Handle to the storage backend.
     storage: OnceCell<Arc<Box<dyn StorageBackend>>>,
+
+    /// Ongoing upload sessions.
+    pub uploads: DashMap<Uuid, ActiveUploadSession>,
 }
 
 /// Request state.
@@ -100,6 +108,7 @@ impl StateInner {
             config,
             database: OnceCell::new(),
             storage: OnceCell::new(),
+            uploads: DashMap::new(),
         })
     }
 
