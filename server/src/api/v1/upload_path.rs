@@ -428,27 +428,17 @@ pub(crate) async fn upload_session_part(
         .into());
     }
 
-    let update = UploadSessionPart::update_many()
-        .col_expr(
-            upload_session_part::Column::State,
-            Expr::value(UploadSessionPartState::Valid.as_str()),
-        )
-        .filter(upload_session_part::Column::Id.eq(insert_result.last_insert_id))
-        .filter(upload_session_part::Column::State.eq(UploadSessionPartState::Pending.as_str()))
-        .exec(database)
+    let txn = database
+        .begin()
         .await
         .map_err(ServerError::database_error)?;
-    if update.rows_affected != 1 {
-        return Err(ErrorKind::RequestError(anyhow!("Upload session part was removed")).into());
-    }
-
     let now = Utc::now();
     let session_update = UploadSession::update_many()
         .col_expr(upload_session::Column::UpdatedAt, Expr::value(now))
         .filter(upload_session::Column::Id.eq(session.id.clone()))
         .filter(upload_session::Column::State.eq(UploadSessionState::Uploading.as_str()))
         .filter(upload_session::Column::ExpiresAt.gt(now))
-        .exec(database)
+        .exec(&txn)
         .await
         .map_err(ServerError::database_error)?;
     if session_update.rows_affected != 1 {
@@ -458,6 +448,21 @@ pub(crate) async fn upload_session_part(
         .into());
     }
 
+    let update = UploadSessionPart::update_many()
+        .col_expr(
+            upload_session_part::Column::State,
+            Expr::value(UploadSessionPartState::Valid.as_str()),
+        )
+        .filter(upload_session_part::Column::Id.eq(insert_result.last_insert_id))
+        .filter(upload_session_part::Column::State.eq(UploadSessionPartState::Pending.as_str()))
+        .exec(&txn)
+        .await
+        .map_err(ServerError::database_error)?;
+    if update.rows_affected != 1 {
+        return Err(ErrorKind::RequestError(anyhow!("Upload session part was removed")).into());
+    }
+
+    txn.commit().await.map_err(ServerError::database_error)?;
     cleanup.cancel();
 
     Ok(())

@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File};
 use tokio::io::{self, AsyncRead};
+use tokio::sync::Mutex;
 
 use super::{Download, RemoteFile, StorageBackend};
 use crate::error::{ErrorKind, ServerError, ServerResult};
@@ -15,6 +16,7 @@ use crate::error::{ErrorKind, ServerError, ServerResult};
 #[derive(Debug)]
 pub struct LocalBackend {
     config: LocalStorageConfig,
+    directory_lock: Mutex<()>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,7 +116,10 @@ impl LocalBackend {
         }
         write_version(&config.path, 1).await?;
 
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            directory_lock: Mutex::new(()),
+        })
     }
 
     fn get_path(&self, p: &str) -> PathBuf {
@@ -161,22 +166,25 @@ impl StorageBackend for LocalBackend {
         mut stream: &mut (dyn AsyncRead + Unpin + Send),
     ) -> ServerResult<RemoteFile> {
         let path = self.get_path(&name);
-        fs::create_dir_all(path.parent().unwrap())
-            .await
-            .map_err(|e| {
+        let mut file = {
+            let _guard = self.directory_lock.lock().await;
+            fs::create_dir_all(path.parent().unwrap())
+                .await
+                .map_err(|e| {
+                    ErrorKind::StorageError(anyhow::anyhow!(
+                        "Failed to create directory {}: {}",
+                        path.parent().unwrap().display(),
+                        e
+                    ))
+                })?;
+            File::create(&path).await.map_err(|e| {
                 ErrorKind::StorageError(anyhow::anyhow!(
-                    "Failed to create directory {}: {}",
-                    path.parent().unwrap().display(),
+                    "Failed to create file {}: {}",
+                    path.display(),
                     e
                 ))
-            })?;
-        let mut file = File::create(self.get_path(&name)).await.map_err(|e| {
-            ErrorKind::StorageError(anyhow::anyhow!(
-                "Failed to create file {}: {}",
-                self.get_path(&name).display(),
-                e
-            ))
-        })?;
+            })?
+        };
 
         io::copy(&mut stream, &mut file)
             .await
@@ -187,6 +195,7 @@ impl StorageBackend for LocalBackend {
 
     async fn delete_file(&self, name: String) -> ServerResult<()> {
         let path = self.get_path(&name);
+        let _guard = self.directory_lock.lock().await;
         fs::remove_file(&path)
             .await
             .map_err(ServerError::storage_error)?;
@@ -206,6 +215,7 @@ impl StorageBackend for LocalBackend {
         };
 
         let path = self.get_path(&file.name);
+        let _guard = self.directory_lock.lock().await;
         fs::remove_file(&path)
             .await
             .map_err(ServerError::storage_error)?;
