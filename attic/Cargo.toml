@@ -23,7 +23,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_with = "3.14.0"
 sha2 = "0.11.0"
 tempfile = "3"
-uuid = { version = "1.17.0", features = ["serde", "v4"] }
+uuid = { version = "1.17.0", features = ["serde"] }
 wildmatch = "2.4.0"
 
 # Native libnixstore bindings.
