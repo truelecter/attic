@@ -37,8 +37,6 @@ pub use hash_reader::HashReader;
 ///              | S3 GET |--------------|
 ///
 /// ```
-///
-/// TODO: Support range requests so we can have seekable NARs.
 pub fn merge_chunks<C, F, S, Fut, E>(
     mut chunks: VecDeque<C>,
     streamer: F,

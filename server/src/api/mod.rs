@@ -1,6 +1,7 @@
 //! HTTP API.
 
 mod binary_cache;
+mod byte_range;
 mod v1;
 
 use axum::{Router, response::Html, routing::get};
